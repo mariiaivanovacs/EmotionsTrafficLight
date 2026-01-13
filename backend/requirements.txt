@@ -1,0 +1,11 @@
+flask
+flask-cors
+flask-socketio
+opencv-python
+fer
+numpy
+tensorflow
+python-socketio
+eventlet
+mediapipe
+scipy

@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Diagnostic Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #1a1a1a;
+            color: #0f0;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 { color: #0ff; }
+        h2 { color: #ff0; margin-top: 30px; }
+        .test-section {
+            background: #2a2a2a;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            border: 2px solid #444;
+        }
+        button {
+            background: #0f0;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            border-radius: 4px;
+        }
+        button:hover { background: #0ff; }
+        .success { color: #0f0; }
+        .error { color: #f00; }
+        .warning { color: #ff0; }
+        pre {
+            background: #000;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .status { font-weight: bold; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>🔍 Emotion Traffic Light - API Diagnostic</h1>
+    
+    <div class="test-section">
+        <h2>1. Backend Health Check</h2>
+        <button onclick="testHealth()">Test Health Endpoint</button>
+        <div id="health-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>2. Camera Detection</h2>
+        <button onclick="testCameras()">Test /api/cameras</button>
+        <div id="cameras-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>3. Face Mesh Availability</h2>
+        <button onclick="testFaceMesh()">Test /api/face_mesh/available</button>
+        <div id="facemesh-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>4. WebSocket Connection</h2>
+        <button onclick="testWebSocket()">Test WebSocket</button>
+        <button onclick="stopWebSocket()">Stop WebSocket</button>
+        <div id="websocket-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>5. Console Logs</h2>
+        <div id="console-logs"></div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        const BACKEND_URL = 'http://localhost:5001';
+        let socket = null;
+        let wsMessageCount = 0;
+
+        // Capture console logs
+        const originalLog = console.log;
+        const originalError = console.error;
+        const logs = [];
+        
+        console.log = function(...args) {
+            logs.push({type: 'log', msg: args.join(' ')});
+            updateConsoleLogs();
+            originalLog.apply(console, args);
+        };
+        
+        console.error = function(...args) {
+            logs.push({type: 'error', msg: args.join(' ')});
+            updateConsoleLogs();
+            originalError.apply(console, args);
+        };
+
+        function updateConsoleLogs() {
+            const div = document.getElementById('console-logs');
+            div.innerHTML = '<pre>' + logs.map(l => 
+                `<span class="${l.type === 'error' ? 'error' : 'success'}">[${l.type}]</span> ${l.msg}`
+            ).join('\n') + '</pre>';
+        }
+
+        async function testHealth() {
+            const div = document.getElementById('health-result');
+            div.innerHTML = '<p class="warning">Testing...</p>';
+            
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/health`);
+                const data = await response.json();
+                
+                div.innerHTML = `
+                    <p class="status success">✓ Backend is running!</p>
+                    <pre>${JSON.stringify(data, null, 2)}</pre>
+                `;
+            } catch (error) {
+                div.innerHTML = `<p class="status error">✗ Error: ${error.message}</p>`;
+            }
+        }
+
+        async function testCameras() {
+            const div = document.getElementById('cameras-result');
+            div.innerHTML = '<p class="warning">Scanning cameras (may take 5-10 seconds)...</p>';
+
+            try {
+                const start = Date.now();
+                const response = await fetch(`${BACKEND_URL}/api/cameras`);
+                const data = await response.json();
+                const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+
+                div.innerHTML = `
+                    <p class="status success">✓ Found ${data.length} camera(s) in ${elapsed}s</p>
+                    <pre>${JSON.stringify(data, null, 2)}</pre>
+                `;
+            } catch (error) {
+                div.innerHTML = `<p class="status error">✗ Error: ${error.message}</p>`;
+            }
+        }
+
+        async function testFaceMesh() {
+            const div = document.getElementById('facemesh-result');
+            div.innerHTML = '<p class="warning">Testing...</p>';
+
+            try {
+                const response = await fetch(`${BACKEND_URL}/api/face_mesh/available`);
+                const data = await response.json();
+
+                div.innerHTML = `
+                    <p class="status ${data.available ? 'success' : 'error'}">
+                        ${data.available ? '✓' : '✗'} Face Mesh ${data.available ? 'Available' : 'Not Available'}
+                    </p>
+                    <pre>${JSON.stringify(data, null, 2)}</pre>
+                `;
+            } catch (error) {
+                div.innerHTML = `<p class="status error">✗ Error: ${error.message}</p>`;
+            }
+        }
+
+        function testWebSocket() {
+            const div = document.getElementById('websocket-result');
+            div.innerHTML = '<p class="warning">Connecting to WebSocket...</p>';
+            wsMessageCount = 0;
+
+            try {
+                socket = io(BACKEND_URL);
+
+                socket.on('connect', () => {
+                    div.innerHTML += '<p class="success">✓ WebSocket connected!</p>';
+                    div.innerHTML += '<p>Listening for events...</p>';
+                });
+
+                socket.on('emotion_update', (data) => {
+                    wsMessageCount++;
+                    div.innerHTML = `
+                        <p class="success">✓ Receiving emotion_update events (${wsMessageCount} received)</p>
+                        <p>Latest data:</p>
+                        <pre>${JSON.stringify(data, null, 2)}</pre>
+                    `;
+                });
+
+                socket.on('face_mesh_update', (data) => {
+                    wsMessageCount++;
+                    div.innerHTML = `
+                        <p class="success">✓ Receiving face_mesh_update events (${wsMessageCount} received)</p>
+                        <p>Latest data:</p>
+                        <pre>${JSON.stringify(data, null, 2)}</pre>
+                    `;
+                });
+
+                socket.on('disconnect', () => {
+                    div.innerHTML += '<p class="warning">⚠ WebSocket disconnected</p>';
+                });
+
+                socket.on('error', (error) => {
+                    div.innerHTML += `<p class="error">✗ WebSocket error: ${error}</p>`;
+                });
+
+            } catch (error) {
+                div.innerHTML = `<p class="status error">✗ Error: ${error.message}</p>`;
+            }
+        }
+
+        function stopWebSocket() {
+            if (socket) {
+                socket.close();
+                socket = null;
+                document.getElementById('websocket-result').innerHTML = '<p class="warning">WebSocket closed</p>';
+            }
+        }
+
+        // Auto-run health check on load
+        window.onload = () => {
+            testHealth();
+        };
+    </script>
+</body>
+</html>
+
