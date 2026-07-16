@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import EmotionDisplay from './components/EmotionDisplay';
 import FaceMeshDisplay from './components/FaceMeshDisplay';
+import FlameReconPanel from './components/FlameReconPanel';
 
 function App() {
   const [activeTab, setActiveTab] = useState('emotion');
@@ -26,11 +27,21 @@ function App() {
         >
           🎯 Face Mesh Analysis (3D)
         </button>
+        <button
+          onClick={() => setActiveTab('flame3d')}
+          style={{
+            ...styles.tab,
+            ...(activeTab === 'flame3d' ? styles.activeTab : {})
+          }}
+        >
+          🔥 FLAME 3D Reconstruction
+        </button>
       </div>
 
       <div style={styles.content}>
         {activeTab === 'emotion' && <EmotionDisplay />}
         {activeTab === 'facemesh' && <FaceMeshDisplay />}
+        {activeTab === 'flame3d' && <FlameReconPanel />}
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import FaceMesh3D from './FaceMesh3D';
+import FlameMeshViewer from './FlameMeshViewer';
 import FeatureGraphs from './FeatureGraphs';
 import ValenceArousalPlot from './ValenceArousalPlot';
 
@@ -238,9 +239,30 @@ const FaceMeshDisplay = () => {
           </div>
 
           <div style={styles.visualization3D}>
-            <h3 style={styles.sectionTitle}>3D Face Model</h3>
+            <h3 style={styles.sectionTitle}>
+              3D Face Model
+              {facesData.length > 0 && facesData[0].flame_mesh && (
+                <span style={{
+                  marginLeft: '10px',
+                  fontSize: '12px',
+                  color: '#00ff88',
+                  fontWeight: 'normal'
+                }}>
+                  🔥 FLAME Mesh
+                </span>
+              )}
+            </h3>
             {facesData.length > 0 ? (
-              <FaceMesh3D landmarks={facesData[0].landmarks_3d} />
+              // Use FLAME mesh if available, otherwise fall back to landmarks
+              facesData[0].flame_mesh ? (
+                <FlameMeshViewer
+                  flameMeshData={facesData[0].flame_mesh}
+                  showStats={true}
+                  meshColor="#00ff88"
+                />
+              ) : (
+                <FaceMesh3D landmarks={facesData[0].landmarks_3d} />
+              )
             ) : (
               <div style={styles.placeholder}>
                 <p>3D mesh will appear here when face is detected</p>

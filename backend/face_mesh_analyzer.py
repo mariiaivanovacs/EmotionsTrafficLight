@@ -1,6 +1,7 @@
 """
 Face Mesh Analyzer - Geometry-based emotion analysis
 Uses MediaPipe Face Mesh for 3D facial landmark detection
+Integrates FLAME parametric 3D face model for dense mesh reconstruction
 """
 
 import numpy as np
@@ -10,6 +11,37 @@ from collections import deque, defaultdict
 from scipy.spatial import distance
 import time
 import os
+import logging
+logger = logging.getLogger(__name__)
+
+# Try to import FLAME model (optional - falls back to landmark-only if not available)
+FLAME_AVAILABLE = False
+flame_model = None
+flame_fitter = None
+
+def to_serializable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_serializable(v) for v in obj]
+    return obj
+
+
+try:
+    from flame_model import get_flame_model
+    from flame_fitter import FLAMEFitter
+    FLAME_AVAILABLE = True
+    print("✓ FLAME model module available")
+except ImportError as e:
+    print(f"⚠️  FLAME not available (will use landmarks only): {e}")
 
 # MediaPipe Face Landmarker (new API for MediaPipe 0.10+)
 BaseOptions = mp.tasks.BaseOptions
@@ -85,16 +117,179 @@ MAX_HISTORY_POINTS = 90  # At 30 FPS = 3 seconds
 
 
 class FaceMeshAnalyzer:
-    """Analyzes facial geometry features from MediaPipe Face Mesh"""
+    """Analyzes facial geometry features from MediaPipe Face Mesh and FLAME 3D model"""
 
-    def __init__(self):
+    def __init__(self, use_flame=True):
+        """
+        Initialize Face Mesh Analyzer
+
+        Args:
+            use_flame: If True, use FLAME parametric model for dense mesh reconstruction
+        """
+        # Initialize MediaPipe Face Landmarker
         try:
             self.face_landmarker = FaceLandmarker.create_from_options(face_landmarker_options)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize Face Landmarker: {e}")
+
         self.feature_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY_POINTS))
         self.timestamps = defaultdict(lambda: deque(maxlen=MAX_HISTORY_POINTS))
         self.previous_valence_zone = {}
+
+        # Initialize FLAME model if requested and available
+        self.use_flame = use_flame and FLAME_AVAILABLE
+        self.flame_model = None
+        self.flame_fitter = None
+
+        if self.use_flame:
+            try:
+                global flame_model, flame_fitter
+                if flame_model is None:
+                    print("Initializing FLAME model...")
+                    flame_model = get_flame_model(use_gpu=False)
+                    # Initialize with PnP solver (uses only MediaPipe X,Y)
+                    flame_fitter = FLAMEFitter(
+                        flame_model,
+                        image_size=(640, 480),  # Camera resolution
+                        focal_length=640,        # Focal length in pixels (default: image_width)
+                        use_pnp=True            # Use PnP solver for metric-correct pose
+                    )
+                    print("✓ FLAME model initialized successfully (PnP solver enabled)")
+
+                self.flame_model = flame_model
+                self.flame_fitter = flame_fitter
+            except Exception as e:
+                print(f"⚠️  Failed to initialize FLAME: {e}")
+                print("   Falling back to landmark-only mode")
+                self.use_flame = False
+                
+                
+                
+
+    def _umeyama_similarity(src, dst, with_scale=True):
+        """
+        Compute similarity transform (s, R, t) that maps src -> dst.
+        src, dst: (N,3) arrays.
+        Returns scale s, rotation R (3x3), translation t (3,)
+        """
+        src = np.asarray(src, dtype=np.float64)
+        dst = np.asarray(dst, dtype=np.float64)
+        assert src.shape == dst.shape and src.ndim == 2 and src.shape[1] == 3
+
+        mu_src = src.mean(axis=0)
+        mu_dst = dst.mean(axis=0)
+        src_centered = src - mu_src
+        dst_centered = dst - mu_dst
+
+        cov = (dst_centered.T @ src_centered) / src.shape[0]
+        U, D, Vt = np.linalg.svd(cov)
+        S = np.eye(3)
+        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+            S[-1, -1] = -1
+        R = U @ S @ Vt
+
+        if with_scale:
+            var_src = (src_centered ** 2).sum() / src.shape[0]
+            s = np.trace(np.diag(D) @ S) / var_src
+        else:
+            s = 1.0
+
+        t = mu_dst - s * (R @ mu_src)
+        return s, R, t
+
+    def process_face_frame(self, face_landmarks, frame, face_idx):
+        """
+        Full preprocessing pipeline (steps 1-6). Returns dict with:
+        landmarks_3d, features, temporal_features, valence, arousal,
+        emotion_label, color, zone, zone_changed,
+        s, R, t, expr_landmarks_canonical, pose_landmarks_xy
+        """
+        # 1) Extract landmarks
+        landmarks_3d = self._extract_landmarks_3d_new(face_landmarks, frame.shape)  # (N,3)
+        logger.info(f"Landmarks 3D: {landmarks_3d.shape}")
+
+        # 2) Compute geometry features + temporal bookkeeping
+        features = self._compute_geometry_features(landmarks_3d, face_idx)
+        for feature_name, value in features.items():
+            self.feature_history[f"face_{face_idx}_{feature_name}"].append(value)
+            self.timestamps[f"face_{face_idx}_{feature_name}"].append(time.time())
+        temporal_features = self._compute_temporal_features(face_idx)
+
+        # 3) Valence / arousal / UI outputs
+        valence, arousal = self._compute_valence_arousal(features)
+        emotion_label, emotion_emoji = self._valence_arousal_to_emotion(valence, arousal)
+        color, zone = self._valence_to_color(valence)
+        zone_changed = self._check_zone_change(face_idx, zone)
+
+        # --- FLAME alignment pipeline ---
+        # Use the FLAME fitter reference indices (must exist)
+        pose_mp_idx = getattr(self, "pose_mp_indices", None)
+        pose_flame_pts = getattr(self.flame_fitter, "pose_reference_3d", None)  # (M,3) canonical FLAME points
+
+        if pose_mp_idx is None or pose_flame_pts is None or len(pose_flame_pts) < 4:
+            # fallback: return minimal info
+            
+            logger.info(f"pose_mp_idx: {pose_mp_idx}")
+            logger.info(f"pose_flame_pts: {pose_flame_pts}")
+            logger.info(f"len(pose_flame_pts): {len(pose_flame_pts)}")
+            logger.warning("[PIPE] insufficient pose reference for rigid alignment")
+            return {
+                "landmarks_3d": landmarks_3d,
+                "features": features,
+                "temporal_features": temporal_features,
+                "valence": valence, "arousal": arousal,
+                "emotion_label": emotion_label, "emotion_emoji": emotion_emoji,
+                "color": color, "zone": zone, "zone_changed": zone_changed,
+                "s": 1.0, "R": np.eye(3), "t": np.zeros(3),
+                "expr_landmarks_canonical": None,
+                "pose_landmarks_xy": landmarks_3d[:, :2]
+            }
+
+        # 4) Prepare corresponding sets for similarity fit
+        # MediaPipe pose landmarks (use X,Y,Z provided by _extract_landmarks_3d_new)
+        pose_landmarks_mp = landmarks_3d[pose_mp_idx].astype(np.float64)  # (M,3)
+        object_points_flame = np.asarray(pose_flame_pts, dtype=np.float64)  # (M,3)
+
+        # Optional: flip Y/Z to match coordinate conventions if needed (depends how you initialized pose_reference_3d)
+        # (Assume pose_reference_3d already adjusted in init; adjust mp coords if needed)
+        # e.g., if MP uses Y-down and your FLAME uses Y-up, flip MP Y: pose_landmarks_mp[:,1] *= -1
+
+        # 5) Compute similarity transform src=object_points_flame -> dst=pose_landmarks_mp
+        try:
+            s, R, t = self._umeyama_similarity(object_points_flame, pose_landmarks_mp, with_scale=True)
+        except Exception as e:
+            logger.exception("[PIPE] Umeyama failed: %s", e)
+            s, R, t = 1.0, np.eye(3), np.zeros(3)
+
+        # 6) Canonicalize expression landmarks: bring MP expression landmarks into FLAME canonical space
+        mp_expr_idx = getattr(self, "mp_expr_indices", None)
+        expr_landmarks_canonical = None
+        if mp_expr_idx is not None and len(mp_expr_idx) > 0:
+            expr_landmarks_mp = landmarks_3d[mp_expr_idx].astype(np.float64)  # (K,3) in MP camera space
+            # invert similarity: x_canonical = (1/s) * R.T @ (x_mp - t)
+            expr_landmarks_canonical = ((R.T @ (expr_landmarks_mp - t).T) / s).T
+        else:
+            logger.warning("[PIPE] no expression indices available")
+
+        # return everything needed for downstream (expression optimization + mesh generation)
+        return {
+            "landmarks_3d": landmarks_3d,
+            "features": features,
+            "temporal_features": temporal_features,
+            "valence": valence,
+            "arousal": arousal,
+            "emotion_label": emotion_label,
+            "emotion_emoji": emotion_emoji,
+            "color": color,
+            "zone": zone,
+            "zone_changed": zone_changed,
+            "s": float(s),
+            "R": R,
+            "t": t,
+            "expr_landmarks_canonical": expr_landmarks_canonical,
+            "pose_landmarks_xy": pose_landmarks_mp[:, :2]
+        }
+
 
     def process_frame(self, frame):
         """Process a single frame and extract face mesh data"""
@@ -111,50 +306,95 @@ class FaceMeshAnalyzer:
             return None
 
         faces_data = []
-        current_time = time.time()
+        # current_time = time.time()
 
         for face_idx, face_landmarks in enumerate(results.face_landmarks):
-            # Extract 3D landmark coordinates
-            landmarks_3d = self._extract_landmarks_3d_new(face_landmarks, frame.shape)
+            flame_mesh_data = None
 
-            # Compute geometry features
-            features = self._compute_geometry_features(landmarks_3d, face_idx)
+            # ----- Step 1: preprocess (process_face_frame does steps 1-6) -----
+            try:
+                out = self.process_face_frame(face_landmarks, frame, face_idx)
+            except Exception as e:
+                logger.exception("process_face_frame failed: %s", e)
+                # fallback: minimal processing so we still return useful data
+                landmarks_3d = self._extract_landmarks_3d_new(face_landmarks, frame.shape)
+                features = self._compute_geometry_features(landmarks_3d, face_idx)
+                temporal_features = self._compute_temporal_features(face_idx)
+                valence, arousal = self._compute_valence_arousal(features)
+                emotion_label, emotion_emoji = self._valence_arousal_to_emotion(valence, arousal)
+                color, zone = self._valence_to_color(valence)
+                zone_changed = self._check_zone_change(face_idx, zone)
 
-            # Store in temporal history
-            for feature_name, value in features.items():
-                self.feature_history[f"face_{face_idx}_{feature_name}"].append(value)
-                self.timestamps[f"face_{face_idx}_{feature_name}"].append(current_time)
+                out = {
+                    "landmarks_3d": landmarks_3d,
+                    "features": features,
+                    "temporal_features": temporal_features,
+                    "valence": valence,
+                    "arousal": arousal,
+                    "emotion_label": emotion_label,
+                    "emotion_emoji": emotion_emoji,
+                    "color": color,
+                    "zone": zone,
+                    "zone_changed": zone_changed,
+                    "s": 1.0,
+                    "R": np.eye(3),
+                    "t": np.zeros(3),
+                    "expr_landmarks_canonical": None
+                }
 
-            # Compute temporal features
-            temporal_features = self._compute_temporal_features(face_idx)
+            # ----- Step 2: FLAME fitting (use existing fit API) -----
+            if self.use_flame and self.flame_fitter is not None:
+                try:
+                    # Use the processed landmarks (we pass full mediapipe landmarks so existing fit() works)
+                    flame_mesh_data = self.flame_fitter.fit(
+                        mediapipe_landmarks_3d=out["landmarks_3d"],
+                        optimize_shape=False,
+                        # Change after 
+                        optimize_expression=False,
+                    )
+                except Exception as e:
+                    logger.exception("FLAME fitting error: %s", e)
+                    flame_mesh_data = None
 
-            # Compute valence/arousal
-            valence, arousal = self._compute_valence_arousal(features)
+         # ----- Step 3: assemble face data -----
+            face_data = {
+                "face_id": int(face_idx),
 
-            # Get emotion label from valence/arousal
-            emotion_label, emotion_emoji = self._valence_arousal_to_emotion(valence, arousal)
+                # Landmarks
+                "landmarks_3d": np.asarray(out["landmarks_3d"]).tolist(),
 
-            # Get traffic light color
-            color, zone = self._valence_to_color(valence)
+                # Features (may be numpy)
+                "geometry_features": np.asarray(out["features"]).tolist() if out.get("features") is not None else None,
+                "temporal_features": np.asarray(out["temporal_features"]).tolist() if out.get("temporal_features") is not None else None,
 
-            # Check for zone change
-            zone_changed = self._check_zone_change(face_idx, zone)
+                # Emotion values (force native Python types)
+                "valence": float(out["valence"]),
+                "arousal": float(out["arousal"]),
+                "valence_zone": str(out["zone"]),
+                "emotion_label": str(out["emotion_label"]),
+                "emotion_emoji": str(out["emotion_emoji"]),
 
-            faces_data.append({
-                'face_id': face_idx,
-                'landmarks_3d': landmarks_3d.tolist(),
-                'geometry_features': features,
-                'temporal_features': temporal_features,
-                'valence': float(valence),
-                'arousal': float(arousal),
-                'valence_zone': zone,
-                'emotion_label': emotion_label,
-                'emotion_emoji': emotion_emoji,
-                'color': color,
-                'zone_changed': zone_changed,
-            })
+                # Color (ensure ints)
+                "color": [int(c) for c in out["color"]],
+
+                "zone_changed": bool(out["zone_changed"]),
+
+                # FLAME mesh (deep convert safely)
+                "flame_mesh": to_serializable(flame_mesh_data),
+
+                # Head pose transform (JSON safe)
+                "pose_transform": {
+                    "scale": float(out.get("s", 1.0)),
+                    "R": np.asarray(out.get("R", np.eye(3))).tolist(),
+                    "t": np.asarray(out.get("t", np.zeros(3))).tolist()
+                }
+            }
+
+
+            faces_data.append(face_data)
 
         return faces_data
+
 
     def _extract_landmarks_3d(self, face_landmarks, frame_shape):
         """Extract 3D coordinates of all landmarks (old API - kept for compatibility)"""
@@ -181,6 +421,50 @@ class FaceMeshAnalyzer:
             landmarks.append([x, y, z])
 
         return np.array(landmarks)
+
+    def _generate_flame_mesh(self, landmarks_3d):
+        """
+        Generate FLAME 3D mesh from MediaPipe landmarks
+
+        Args:
+            landmarks_3d: (468, 3) numpy array of MediaPipe landmarks
+
+        Returns:
+            dict with FLAME mesh data:
+                - vertices: (5023, 3) mesh vertices
+                - faces: (N, 3) triangle indices
+                - normals: (5023, 3) vertex normals
+                - centroid: (3,) mesh center
+                - flame_params: dict of FLAME parameters
+                - fit_time_ms: fitting time in milliseconds
+        """
+        if not self.use_flame or self.flame_fitter is None:
+            return None
+
+        # Fit FLAME model to landmarks
+        result = self.flame_fitter.fit(
+            mediapipe_landmarks_3d=landmarks_3d,
+            optimize_shape=False,  # Keep identity stable (too slow for real-time)
+            optimize_expression=False   # Optimize expressions each frame
+            # Change after
+        )
+
+        # Convert numpy arrays to lists for JSON serialization
+        flame_mesh_data = {
+            'vertices': result['vertices'].tolist(),
+            'faces': result['faces'].tolist(),
+            'normals': result['normals'].tolist(),
+            'centroid': result['centroid'].tolist(),
+            'flame_params': {
+                'shape': result['shape_params'].tolist(),
+                'expression': result['expression_params'].tolist(),
+                'pose': result['pose_params'].tolist(),
+            },
+            'fit_time_ms': result['fit_time_ms'],
+            'num_landmarks_used': result['num_landmarks_used'],
+        }
+
+        return flame_mesh_data
 
     def _get_landmark(self, landmarks, key):
         """Get specific landmark by key"""

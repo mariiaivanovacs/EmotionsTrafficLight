@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import cv2
@@ -358,6 +358,8 @@ def face_mesh_loop():
     frame_count = 0
     fps_history = deque(maxlen=30)
     last_time = time.time()
+    min_interval = 0.33  # seconds between processed frames (~1/3 frames at 30 FPS)
+
 
     try:
         while not mesh_thread_stop_flag.is_set():
@@ -370,7 +372,9 @@ def face_mesh_loop():
                 if not success:
                     logger.error("Failed to read frame in mesh loop")
                     break
-
+                
+                
+            
             # Process with face mesh analyzer
             try:
                 face_data = face_mesh_analyzer.process_frame(frame)
@@ -429,6 +433,26 @@ def face_mesh_loop():
             mesh_data = []
             if face_data:
                 for face in face_data:
+                    
+                    lm = np.asarray(face['landmarks_3d'])
+
+                    mp_points = np.stack([
+                        lm[234],
+                        lm[454],
+                        lm[10],
+                        lm[6]
+                    ])
+
+                    x_axis = mp_points[1] - mp_points[0]
+                    x_axis /= np.linalg.norm(x_axis)
+                    v_temp = mp_points[2] - mp_points[3]
+                    v_temp /= np.linalg.norm(v_temp)
+                    z_axis = np.cross(x_axis, v_temp)
+                    z_axis /= np.linalg.norm(z_axis)
+                    y_axis = np.cross(z_axis, x_axis)
+                    R_mp = np.stack([x_axis, y_axis, z_axis], axis=1)
+                    logger.info(f"R_mp: {R_mp}")
+
                     mesh_data.append({
                         'face_id': face['face_id'],
                         'landmarks_3d': face['landmarks_3d'],
@@ -440,8 +464,13 @@ def face_mesh_loop():
                         'emotion_label': face.get('emotion_label', 'Unknown'),
                         'emotion_emoji': face.get('emotion_emoji', '😐'),
                         'zone_changed': face['zone_changed'],
-                        'color': f"rgb({face['color'][2]}, {face['color'][1]}, {face['color'][0]})"
+                        'color': f"rgb({face['color'][2]}, {face['color'][1]}, {face['color'][0]})",
+                        'flame_mesh': face.get('flame_mesh'),
+                        'rotation_matrix': R_mp.tolist(),
                     })
+                    
+                    
+            
 
             # Emit frame and mesh data via WebSocket
             try:
@@ -526,6 +555,38 @@ def stop_face_mesh():
 def face_mesh_available():
     """Check if face mesh is available"""
     return jsonify({'available': FACE_MESH_AVAILABLE})
+
+@app.route('/api/face_mesh/save_landmarks', methods=['POST'])
+def save_face_landmarks():
+    """Save current MediaPipe landmarks to file"""
+    try:
+        data = request.get_json()
+
+        if not data or 'landmarks_3d' not in data:
+            return jsonify({'status': 'error', 'message': 'No landmarks data provided'}), 400
+
+        landmarks_3d = np.array(data['landmarks_3d'])
+
+
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        save_path = os.path.join(current_dir, "mp_neutral_frame.npy")
+
+        # Save the file
+        np.save(save_path, landmarks_3d)
+
+        logger.info(f"✓ Saved face landmarks to {save_path}")
+        logger.info(f"  Shape: {landmarks_3d.shape}")
+
+        return jsonify({
+            'status': 'success',
+            'message': f'Landmarks saved to {save_path}',
+            'shape': landmarks_3d.shape
+        })
+
+    except Exception as e:
+        logger.error(f"Error saving landmarks: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ===== SOCKETIO HANDLERS =====
 
